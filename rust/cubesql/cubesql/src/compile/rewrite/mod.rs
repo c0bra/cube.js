@@ -313,6 +313,14 @@ crate::plan_to_language! {
             members: Vec<LogicalPlan>,
             alias_to_cube: Vec<(String, String)>,
         },
+        GroupExprSplitReplacer {
+            members: Vec<LogicalPlan>,
+            alias_to_cube: Vec<(String, String)>,
+        },
+        GroupAggregateSplitReplacer {
+            members: Vec<LogicalPlan>,
+            alias_to_cube: Vec<(String, String)>,
+        },
     }
 }
 
@@ -780,6 +788,17 @@ fn outer_projection_split_replacer(members: impl Display, alias_to_cube: impl Di
 fn outer_aggregate_split_replacer(members: impl Display, alias_to_cube: impl Display) -> String {
     format!(
         "(OuterAggregateSplitReplacer {} {})",
+        members, alias_to_cube
+    )
+}
+
+fn group_expr_split_replacer(members: impl Display, alias_to_cube: impl Display) -> String {
+    format!("(GroupExprSplitReplacer {} {})", members, alias_to_cube)
+}
+
+fn group_aggregate_split_replacer(members: impl Display, alias_to_cube: impl Display) -> String {
+    format!(
+        "(GroupAggregateSplitReplacer {} {})",
         members, alias_to_cube
     )
 }
