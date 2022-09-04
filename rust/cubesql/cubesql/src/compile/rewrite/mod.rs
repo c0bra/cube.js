@@ -214,6 +214,7 @@ crate::plan_to_language! {
             offset: Option<usize>,
             aliases: Option<Vec<String>>,
             split: bool,
+            aggregate: bool,
         },
         Measure {
             name: String,
@@ -692,6 +693,20 @@ fn filter(expr: impl Display, input: impl Display) -> String {
     format!("(Filter {} {})", expr, input)
 }
 
+fn join(
+    left: impl Display,
+    right: impl Display,
+    left_on: impl Display,
+    right_on: impl Display,
+    join_type: impl Display,
+    join_constraint: impl Display,
+) -> String {
+    format!(
+        "(Join {} {} {} {} {} {})",
+        left, right, left_on, right_on, join_type, join_constraint,
+    )
+}
+
 fn cross_join(left: impl Display, right: impl Display) -> String {
     format!("(CrossJoin {} {})", left, right)
 }
@@ -872,10 +887,11 @@ fn cube_scan(
     offset: impl Display,
     aliases: impl Display,
     split: impl Display,
+    aggregate: impl Display,
 ) -> String {
     format!(
-        "(Extension (CubeScan {} {} {} {} {} {} {} {}))",
-        alias_to_cube, members, filters, orders, limit, offset, aliases, split
+        "(Extension (CubeScan {} {} {} {} {} {} {} {} {}))",
+        alias_to_cube, members, filters, orders, limit, offset, aliases, split, aggregate,
     )
 }
 
