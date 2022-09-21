@@ -343,6 +343,53 @@ curl \
  http://localhost:4000/cubejs-api/v1/run-scheduled-refresh
 ```
 
+### <--{"id" : "API Reference"}--> /cubejs-system/v1/pre-aggregations/jobs
+
+Submit pre-aggregation build jobs and retrieve their refresh status.
+
+#### Submitting a job
+
+| Parameter                  | Description                                                        | Required |
+|----------------------------|--------------------------------------------------------------------|----------|
+| `selector.contexts`        | An array of contexts to use                                        | ✅        |
+| `selector.timezones`       | An array of timezones to use                                       | ❌        |
+| `selector.datasources`     | An array of data source names of the pre-aggregation to build      | ✅        |
+| `selector.cubes`           | An array of cube names which contain the pre-aggregations to build | ✅        |
+| `selector.preAggregations` | An array of pre-aggregation names to build                         | ✅        |
+
+To submit a job, send a `POST` request with a `selector` object. The response will
+include the `jobId` of the submitted job.
+
+Example request:
+
+XXX
+
+Example response:
+
+XXX
+
+#### Retrieving statuses for a job
+
+| Parameter            | Description                                         | Required |
+|----------------------|-----------------------------------------------------|----------|
+| `selector.request`   | A request ID                                        | ❌        |
+| `selector.context`   | The context of the pre-aggregation build to look up | ✅        |
+| `selector.preagg`    | The name of the pre-aggregation                     | ✅        |
+| `selector.table`     | The name of the table in the data source            | ✅        |
+| `selector.target`    | XXX                                                 | ✅        |
+| `selector.structure` | XXX                                                 | ✅        |
+| `selector.content`   | XXX                                                 | ✅        |
+| `selector.updated`   | XXX                                                 | ✅        |
+| `selector.key`       | XXX                                                 | ✅        |
+
+Example request:
+
+XXX
+
+Example response:
+
+XXX
+
 ### <--{"id" : "API Reference"}--> /readyz
 
 Returns the ready state of the deployment.
