@@ -64,6 +64,9 @@ pub enum Statement {
     CacheGet {
         key: Ident,
     },
+    CacheKeys {
+        prefix: Ident,
+    },
     CacheRemove {
         key: Ident,
     },
@@ -187,6 +190,9 @@ impl<'a> CubeStoreParser<'a> {
             }
             "get" => Ok(Statement::CacheGet {
                 key: self.parser.parse_identifier()?,
+            }),
+            "keys" => Ok(Statement::CacheKeys {
+                prefix: self.parser.parse_identifier()?,
             }),
             "remove" => Ok(Statement::CacheRemove {
                 key: self.parser.parse_identifier()?,

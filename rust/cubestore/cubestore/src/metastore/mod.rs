@@ -723,6 +723,7 @@ pub struct Partition {
 data_frame_from! {
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct CacheItem {
+    prefix: String,
     key: String,
     #[serde(default)]
     value: String,
@@ -1185,6 +1186,7 @@ pub trait MetaStore: DIService + Send + Sync {
     async fn cache_truncate(&self) -> Result<(), CubeError>;
     async fn cache_delete(&self, key: String) -> Result<(), CubeError>;
     async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError>;
+    async fn cache_keys(&self, prefix: String) -> Result<Vec<IdRow<CacheItem>>, CubeError>;
 
     // Force compaction for specific column family
     async fn cf_compaction(&self, cf: ColumnFamilyName) -> Result<(), CubeError>;
@@ -3667,12 +3669,24 @@ impl MetaStore for RocksMetaStore {
         .await
     }
 
+    async fn cache_keys(&self, prefix: String) -> Result<Vec<IdRow<CacheItem>>, CubeError> {
+        self.read_operation_cache(move |db_ref| {
+            let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+            let index_key = CacheItemIndexKey::ByPrefix(prefix);
+            let rows =
+                cache_schema.get_rows_by_index(&index_key, &CacheItemRocksIndex::ByPrefix)?;
+
+            Ok(rows)
+        })
+        .await
+    }
+
     async fn cache_set(&self, item: CacheItem, nx: bool) -> Result<bool, CubeError> {
         self.write_operation_cache(move |db_ref, batch_pipe| {
             let cache_schema = CacheItemRocksTable::new(db_ref.clone());
-            let index_key = CacheItemIndexKey::ByKey(item.key.clone());
-            let id_row_opt =
-                cache_schema.get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::Key)?;
+            let index_key = CacheItemIndexKey::ByPath(item.key.clone());
+            let id_row_opt = cache_schema
+                .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
 
             if let Some(id_row) = id_row_opt {
                 if nx && !id_row.row.is_expired() {
@@ -3711,9 +3725,9 @@ impl MetaStore for RocksMetaStore {
     async fn cache_delete(&self, key: String) -> Result<(), CubeError> {
         self.write_operation_cache(move |db_ref, batch_pipe| {
             let cache_schema = CacheItemRocksTable::new(db_ref.clone());
-            let index_key = CacheItemIndexKey::ByKey(key);
-            let row_opt =
-                cache_schema.get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::Key)?;
+            let index_key = CacheItemIndexKey::ByPath(key);
+            let row_opt = cache_schema
+                .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
 
             if let Some(row) = row_opt {
                 cache_schema.delete(row.id, batch_pipe)?;
@@ -3762,9 +3776,9 @@ impl MetaStore for RocksMetaStore {
     async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError> {
         self.read_operation_cache(move |db_ref| {
             let cache_schema = CacheItemRocksTable::new(db_ref.clone());
-            let index_key = CacheItemIndexKey::ByKey(key);
-            let id_row_opt =
-                cache_schema.get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::Key)?;
+            let index_key = CacheItemIndexKey::ByPath(key);
+            let id_row_opt = cache_schema
+                .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
 
             if let Some(id_row) = id_row_opt {
                 if !id_row.row.is_expired() {

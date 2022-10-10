@@ -1092,6 +1092,15 @@ impl SqlService for SqlServiceImpl {
                     )))
                 }
             }
+            CubeStoreStatement::CacheKeys { prefix } => {
+                let rows = self.db.cache_keys(prefix.value).await?;
+                Ok(Arc::new(DataFrame::new(
+                    vec![Column::new("key".to_string(), ColumnType::String, 0)],
+                    rows.iter()
+                        .map(|i| Row::new(vec![TableValue::String(i.get_row().get_path())]))
+                        .collect(),
+                )))
+            }
             CubeStoreStatement::CacheRemove { key } => {
                 self.db.cache_delete(key.value).await?;
 

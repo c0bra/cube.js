@@ -28,6 +28,14 @@ impl InfoSchemaTableDef for InfoSchemaCacheDef {
                 }),
             ),
             (
+                Field::new("prefix", DataType::Utf8, false),
+                Box::new(|items| {
+                    Arc::new(StringArray::from_iter(
+                        items.iter().map(|row| Some(row.get_row().get_prefix())),
+                    ))
+                }),
+            ),
+            (
                 Field::new(
                     "expire",
                     DataType::Timestamp(TimeUnit::Nanosecond, None),

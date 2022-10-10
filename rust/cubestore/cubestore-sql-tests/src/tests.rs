@@ -214,6 +214,7 @@ pub fn sql_tests() -> Vec<(&'static str, TestFn)> {
         t("cache_set_get_set_get", cache_set_get_set_get),
         t("cache_compaction", cache_compaction),
         t("cache_set_nx", cache_set_nx),
+        t("cache_prefix_keys", cache_prefix_keys),
     ];
 
     fn t<F>(name: &'static str, f: fn(Box<dyn SqlClient>) -> F) -> (&'static str, TestFn)
@@ -6114,6 +6115,35 @@ async fn cache_set_nx(service: Box<dyn SqlClient>) {
     assert_eq!(
         set_response.get_rows(),
         &vec![Row::new(vec![TableValue::Boolean(true),]),]
+    );
+}
+
+async fn cache_prefix_keys(service: Box<dyn SqlClient>) {
+    service
+        .exec_query("CACHE SET 'locks:key1' '1';")
+        .await
+        .unwrap();
+    service
+        .exec_query("CACHE SET 'locks:key2' '2';")
+        .await
+        .unwrap();
+    service
+        .exec_query("CACHE SET 'locks:key3' '3';")
+        .await
+        .unwrap();
+
+    let keys_response = service.exec_query("CACHE KEYS 'locks'").await.unwrap();
+    assert_eq!(
+        keys_response.get_columns(),
+        &vec![Column::new("key".to_string(), ColumnType::String, 0),]
+    );
+    assert_eq!(
+        keys_response.get_rows(),
+        &vec![
+            Row::new(vec![TableValue::String("locks:key1".to_string())]),
+            Row::new(vec![TableValue::String("locks:key2".to_string())]),
+            Row::new(vec![TableValue::String("locks:key3".to_string())]),
+        ]
     );
 }
 
