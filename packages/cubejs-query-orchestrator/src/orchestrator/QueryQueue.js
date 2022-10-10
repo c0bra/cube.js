@@ -28,9 +28,20 @@ export class QueryQueue {
       redisPool: options.redisPool,
       getQueueEventsBus: options.getQueueEventsBus
     };
-    this.queueDriver = options.cacheAndQueueDriver === 'redis' ?
-      new RedisQueueDriver(queueDriverOptions) :
-      new LocalQueueDriver(queueDriverOptions);
+    switch (options.cacheAndQueueDriver) {
+      case 'redis':
+        this.queueDriver = new RedisQueueDriver(queueDriverOptions);
+        break;
+      case 'memory':
+        this.queueDriver = new LocalQueueDriver(queueDriverOptions);
+        break;
+      case 'cubestore':
+        this.queueDriver = new LocalQueueDriver(queueDriverOptions);
+        break;
+      default:
+        throw new Error(`Unknown queue driver: ${options.cacheAndQueueDriver}`);
+    }
+
     this.skipQueue = options.skipQueue;
   }
 
@@ -65,7 +76,7 @@ export class QueryQueue {
         throw new Error('Priority should be between -10000 and 10000');
       }
       let result = !query.forceBuild && await redisClient.getResult(queryKey);
-      
+
       if (result) {
         return this.parseResult(result);
       }
@@ -201,7 +212,7 @@ export class QueryQueue {
               status: []
             };
           }
-  
+
           obj[query.queryKey].status.push(status);
         });
         return obj;

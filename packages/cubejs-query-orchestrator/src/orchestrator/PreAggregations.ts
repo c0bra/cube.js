@@ -18,14 +18,12 @@ import { cancelCombinator, SaveCancelFn, DriverInterface, BaseDriver,
   DownloadTableData,
   InlineTable,
   StreamOptions,
-  UnloadOptions,
-  DriverCapabilities } from '@cubejs-backend/base-driver';
+  UnloadOptions, CacheDriverInterface, DriverCapabilities } from '@cubejs-backend/base-driver';
 import { RedisCacheDriver } from './RedisCacheDriver';
 import { LocalCacheDriver } from './LocalCacheDriver';
 import { Query, QueryCache, QueryTuple, QueryWithParams } from './QueryCache';
 import { ContinueWaitError } from './ContinueWaitError';
 import { DriverFactory, DriverFactoryByDataSource } from './DriverFactory';
-import { CacheDriverInterface } from './cache-driver.interface';
 import { QueryQueue } from './QueryQueue';
 import { LargeStreamWarning } from './StreamObjectsCounter';
 
@@ -960,7 +958,7 @@ export class PreAggregationLoader {
     if (withTempTable) {
       const [loadSql, params] =
       Array.isArray(this.preAggregation.loadSql) ? this.preAggregation.loadSql : [this.preAggregation.loadSql, []];
-  
+
       const query = QueryCache.replacePreAggregationTableNames(loadSql, this.preAggregationsTablesToTempTables)
         .replace(
           this.preAggregation.tableName,
