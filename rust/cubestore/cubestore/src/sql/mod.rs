@@ -753,6 +753,13 @@ impl SqlService for SqlServiceImpl {
             }
             CubeStoreStatement::System(command) => match command {
                 SystemCommand::Compaction { cf } => {
+                    #[cfg(not(debug_assertions))]
+                    {
+                        return Err(CubeError::user(
+                            "Forcing compaction is not allowed in release mode",
+                        ));
+                    }
+
                     self.db.cf_compaction(cf).await?;
                     Ok(Arc::new(DataFrame::new(vec![], vec![])))
                 }
