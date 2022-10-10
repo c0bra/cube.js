@@ -1,16 +1,12 @@
 use super::{
-    BaseRocksSecondaryIndex, CacheItem, IndexId, RocksSecondaryIndex, RocksTable, TableId,
+    BaseRocksSecondaryIndex, CacheItem, ColumnFamilyName, IdRow, IndexId, MetaStoreEvent,
+    RocksSecondaryIndex, RocksTable, TableId,
 };
-use crate::metastore::{ColumnFamilyName, IdRow, MetaStoreEvent};
-use crate::rocks_table_impl;
-
-use crate::base_rocks_secondary_index;
+use crate::{base_rocks_secondary_index, rocks_table_impl};
 
 use chrono::{DateTime, Duration, Utc};
-
 use rocksdb::DB;
 use serde::{Deserialize, Deserializer};
-use std::ops::Add;
 
 impl CacheItem {
     pub fn new(path: String, ttl: Option<u32>, value: String) -> CacheItem {
@@ -25,7 +21,7 @@ impl CacheItem {
             prefix,
             key,
             value,
-            expire: ttl.map(|ttl| Utc::now().add(Duration::seconds(ttl as i64))),
+            expire: ttl.map(|ttl| Utc::now() + Duration::seconds(ttl as i64)),
         }
     }
 
