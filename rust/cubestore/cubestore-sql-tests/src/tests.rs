@@ -210,6 +210,7 @@ pub fn sql_tests() -> Vec<(&'static str, TestFn)> {
         t("inline_tables", inline_tables),
         t("inline_tables_2x", inline_tables_2x),
         t("build_range_end", build_range_end),
+        t("cache_compaction", cache_compaction),
         t("cache_set_nx", cache_set_nx),
     ];
 
@@ -5988,8 +5989,33 @@ async fn build_range_end(service: Box<dyn SqlClient>) {
     );
 }
 
+async fn cache_compaction(service: Box<dyn SqlClient>) {
+    service
+        .exec_query("CACHE SET NX TTL 5 'key_compaction' 'myvalue';")
+        .await
+        .unwrap();
+
+    let get_response = service
+        .exec_query("CACHE GET 'key_compaction'")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        get_response.get_columns(),
+        &vec![Column::new("value".to_string(), ColumnType::String, 0),]
+    );
+
+    assert_eq!(
+        get_response.get_rows(),
+        &vec![Row::new(vec![TableValue::String("myvalue".to_string()),]),]
+    );
+
+    service.exec_query("SYS COMPACTION 'cache';").await.unwrap();
+    sleep(Duration::new(5, 0)).await;
+}
+
 async fn cache_set_nx(service: Box<dyn SqlClient>) {
-    let set_nx_key_sql = "CACHE SET NX TTL 5 'mykey' 'myvalue';";
+    let set_nx_key_sql = "CACHE SET NX TTL 4 'mykey' 'myvalue';";
 
     let set_response = service.exec_query(set_nx_key_sql).await.unwrap();
 
