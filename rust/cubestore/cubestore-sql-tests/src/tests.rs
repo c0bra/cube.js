@@ -210,6 +210,8 @@ pub fn sql_tests() -> Vec<(&'static str, TestFn)> {
         t("inline_tables", inline_tables),
         t("inline_tables_2x", inline_tables_2x),
         t("build_range_end", build_range_end),
+        t("cache_set_get_rm", cache_set_get_rm),
+        t("cache_set_get_set_get", cache_set_get_set_get),
         t("cache_compaction", cache_compaction),
         t("cache_set_nx", cache_set_nx),
     ];
@@ -5989,6 +5991,78 @@ async fn build_range_end(service: Box<dyn SqlClient>) {
     );
 }
 
+async fn cache_set_get_rm(service: Box<dyn SqlClient>) {
+    service
+        .exec_query("CACHE SET 'key_to_rm' 'myvalue';")
+        .await
+        .unwrap();
+
+    let get_response = service.exec_query("CACHE GET 'key_to_rm'").await.unwrap();
+
+    assert_eq!(
+        get_response.get_columns(),
+        &vec![Column::new("value".to_string(), ColumnType::String, 0),]
+    );
+
+    assert_eq!(
+        get_response.get_rows(),
+        &vec![Row::new(vec![TableValue::String("myvalue".to_string()),]),]
+    );
+
+    service
+        .exec_query("CACHE REMOVE 'key_to_rm' 'myvalue';")
+        .await
+        .unwrap();
+
+    let get_response = service
+        .exec_query("CACHE GET 'key_compaction'")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        get_response.get_rows(),
+        &vec![Row::new(vec![TableValue::Null,]),]
+    );
+}
+
+async fn cache_set_get_set_get(service: Box<dyn SqlClient>) {
+    // Initial set
+    {
+        service
+            .exec_query("CACHE SET 'key_for_update' '1';")
+            .await
+            .unwrap();
+
+        let get_response = service
+            .exec_query("CACHE GET 'key_for_update'")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_response.get_rows(),
+            &vec![Row::new(vec![TableValue::String("1".to_string()),]),]
+        );
+    }
+
+    // update
+    {
+        service
+            .exec_query("CACHE SET 'key_for_update' '2';")
+            .await
+            .unwrap();
+
+        let get_response = service
+            .exec_query("CACHE GET 'key_for_update'")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_response.get_rows(),
+            &vec![Row::new(vec![TableValue::String("2".to_string()),]),]
+        );
+    }
+}
+
 async fn cache_compaction(service: Box<dyn SqlClient>) {
     service
         .exec_query("CACHE SET NX TTL 5 'key_compaction' 'myvalue';")
@@ -5999,11 +6073,6 @@ async fn cache_compaction(service: Box<dyn SqlClient>) {
         .exec_query("CACHE GET 'key_compaction'")
         .await
         .unwrap();
-
-    assert_eq!(
-        get_response.get_columns(),
-        &vec![Column::new("value".to_string(), ColumnType::String, 0),]
-    );
 
     assert_eq!(
         get_response.get_rows(),

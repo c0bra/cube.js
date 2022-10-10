@@ -1873,11 +1873,13 @@ trait RocksTable: Debug + Send + Sync {
             IdRow::new(row_id, old_row.clone()),
             IdRow::new(row_id, new_row.clone()),
         ));
-        batch_pipe.batch().put(updated_row.key, updated_row.val);
+        batch_pipe
+            .batch()
+            .put_cf(self.cf()?, updated_row.key, updated_row.val);
 
         let index_row = self.insert_index_row(&new_row, row_id)?;
         for row in index_row {
-            batch_pipe.batch().put(row.key, row.val);
+            batch_pipe.batch().put_cf(self.cf()?, row.key, row.val);
         }
         Ok(IdRow::new(row_id, new_row))
     }
@@ -2472,7 +2474,7 @@ impl RocksMetaStore {
             + 'static,
         R: Send + Sync + 'static,
     {
-        self.write_operation_impl(self.default_rw_loop_tx.clone(), f)
+        self.write_operation_impl("default", self.default_rw_loop_tx.clone(), f)
             .await
     }
 
@@ -2484,11 +2486,16 @@ impl RocksMetaStore {
             + 'static,
         R: Send + Sync + 'static,
     {
-        self.write_operation_impl(self.cache_rw_loop_tx.clone(), f)
+        self.write_operation_impl("cache", self.cache_rw_loop_tx.clone(), f)
             .await
     }
 
-    async fn write_operation_impl<F, R>(&self, rw_loop_tx: RwLoopTx, f: F) -> Result<R, CubeError>
+    async fn write_operation_impl<F, R>(
+        &self,
+        loop_name: &'static str,
+        rw_loop_tx: RwLoopTx,
+        f: F,
+    ) -> Result<R, CubeError>
     where
         F: for<'a> FnOnce(DbTableRef<'a>, &'a mut BatchPipe) -> Result<R, CubeError>
             + Send
@@ -2524,16 +2531,18 @@ impl RocksMetaStore {
                         }
                         let write_result = batch.batch_write_rows()?;
                         tx.send(Ok((res, write_result))).map_err(|_| {
-                            CubeError::internal(
-                                "Write operation result receiver has been dropped".to_string(),
-                            )
+                            CubeError::internal(format!(
+                                "Write operation result receiver has been dropped [{}]",
+                                loop_name
+                            ))
                         })?;
                     }
                     Err(e) => {
                         tx.send(Err(e)).map_err(|_| {
-                            CubeError::internal(
-                                "Write operation result receiver has been dropped".to_string(),
-                            )
+                            CubeError::internal(format!(
+                                "Write operation result receiver has been dropped [{}]",
+                                loop_name
+                            ))
                         })?;
                     }
                 }
@@ -3670,17 +3679,11 @@ impl MetaStore for RocksMetaStore {
                     return Ok(false);
                 };
 
-                cache_schema.update_with_fn(
-                    id_row.id,
-                    move |row| {
-                        let mut new = row.clone();
-                        new.value = item.value;
-                        new.expire = item.expire;
+                let mut new = id_row.row.clone();
+                new.value = item.value;
+                new.expire = item.expire;
 
-                        new
-                    },
-                    batch_pipe,
-                )?;
+                cache_schema.update(id_row.id, new, &id_row.row, batch_pipe)?;
             } else {
                 cache_schema.insert(item, batch_pipe)?;
             }
