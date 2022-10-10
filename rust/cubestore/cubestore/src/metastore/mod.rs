@@ -1715,7 +1715,7 @@ trait RocksTable: Debug + Send + Sync {
             let index_row = self.index_key_val(row.get_row(), row.get_id(), index);
             println!("put index {:?} {:?}", index_row.key, index_row.val);
 
-            batch.put(index_row.key, index_row.val);
+            batch.put_cf(self.cf()?, index_row.key, index_row.val);
         }
 
         batch.put_cf(
@@ -1915,7 +1915,7 @@ trait RocksTable: Debug + Send + Sync {
 
         let mut to_write = vec![];
         to_write.write_u64::<BigEndian>(next_seq)?;
-        db.put(seq_key.to_bytes(), to_write)?;
+        db.put_cf(self.cf()?, seq_key.to_bytes(), to_write)?;
 
         Ok(next_seq)
     }
