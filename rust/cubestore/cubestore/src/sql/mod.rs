@@ -44,8 +44,8 @@ use crate::metastore::job::JobType;
 use crate::metastore::multi_index::MultiIndex;
 use crate::metastore::source::SourceCredentials;
 use crate::metastore::{
-    is_valid_plain_binary_hll, table::Table, HllFlavour, IdRow, ImportFormat, Index, IndexDef,
-    IndexType, MetaStoreTable, RowKey, Schema, TableId,
+    is_valid_plain_binary_hll, table::Table, CacheItem, HllFlavour, IdRow, ImportFormat, Index,
+    IndexDef, IndexType, MetaStoreTable, RowKey, Schema, TableId,
 };
 use crate::queryplanner::panic::PanicWorkerNode;
 use crate::queryplanner::pretty_printers::{pp_phys_plan, pp_plan};
@@ -752,6 +752,10 @@ impl SqlService for SqlServiceImpl {
                 }
             }
             CubeStoreStatement::System(command) => match command {
+                SystemCommand::Compaction { cf } => {
+                    self.db.cf_compaction(cf).await?;
+                    Ok(Arc::new(DataFrame::new(vec![], vec![])))
+                }
                 SystemCommand::KillAllJobs => {
                     self.db.delete_all_jobs().await?;
                     Ok(Arc::new(DataFrame::new(vec![], vec![])))
@@ -1045,6 +1049,50 @@ impl SqlService for SqlServiceImpl {
 
                 self.insert_data(schema_name.clone(), table_name.clone(), &columns, data)
                     .await?;
+                Ok(Arc::new(DataFrame::new(vec![], vec![])))
+            }
+            CubeStoreStatement::CacheSet {
+                key,
+                value,
+                ttl,
+                nx,
+            } => {
+                let key = key.value;
+
+                let success = self
+                    .db
+                    .cache_set(CacheItem::new(key, ttl, value), nx)
+                    .await?;
+
+                Ok(Arc::new(DataFrame::new(
+                    vec![Column::new("success".to_string(), ColumnType::Boolean, 0)],
+                    vec![Row::new(vec![TableValue::Boolean(success)])],
+                )))
+            }
+            CubeStoreStatement::CacheGet { key } => {
+                let row = self.db.cache_get(key.value).await?;
+                if let Some(r) = row {
+                    Ok(Arc::new(DataFrame::new(
+                        vec![Column::new("value".to_string(), ColumnType::String, 0)],
+                        vec![Row::new(vec![TableValue::String(
+                            r.get_row().get_value().clone(),
+                        )])],
+                    )))
+                } else {
+                    Ok(Arc::new(DataFrame::new(
+                        vec![Column::new("value".to_string(), ColumnType::String, 0)],
+                        vec![Row::new(vec![TableValue::Null])],
+                    )))
+                }
+            }
+            CubeStoreStatement::CacheRemove { key } => {
+                self.db.cache_delete(key.value).await?;
+
+                Ok(Arc::new(DataFrame::new(vec![], vec![])))
+            }
+            CubeStoreStatement::CacheTruncate {} => {
+                self.db.cache_truncate().await?;
+
                 Ok(Arc::new(DataFrame::new(vec![], vec![])))
             }
             CubeStoreStatement::Statement(Statement::Query(q)) => {

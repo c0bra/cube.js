@@ -1,4 +1,6 @@
+pub mod cache;
 pub mod chunks;
+pub mod compaction;
 pub mod index;
 pub mod job;
 pub mod listener;
@@ -14,8 +16,8 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use log::info;
 use rocksdb::{
-    DBIterator, Direction, IteratorMode, MergeOperands, Options, ReadOptions, Snapshot, WriteBatch,
-    WriteBatchIterator, DB,
+    ColumnFamily, ColumnFamilyDescriptor, DBIterator, Direction, IteratorMode, MergeOperands,
+    Options, ReadOptions, Snapshot, WriteBatch, WriteBatchIterator, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::hash::{Hash, Hasher};
@@ -25,6 +27,7 @@ use tokio::sync::{oneshot, Notify, RwLock};
 
 use crate::config::injection::DIService;
 use crate::config::{Config, ConfigObj};
+use crate::metastore::cache::CacheItemIndexKey;
 use crate::metastore::chunks::{ChunkIndexKey, ChunkRocksIndex};
 use crate::metastore::index::IndexIndexKey;
 use crate::metastore::job::{Job, JobIndexKey, JobRocksIndex, JobRocksTable, JobStatus, JobType};
@@ -46,6 +49,7 @@ use crate::util::WorkerLoop;
 use crate::CubeError;
 use arrow::datatypes::TimeUnit::Microsecond;
 use arrow::datatypes::{DataType, Field};
+use cache::{CacheItemRocksIndex, CacheItemRocksTable};
 use chrono::{DateTime, Utc};
 use chunks::ChunkRocksTable;
 use core::{fmt, mem};
@@ -68,6 +72,7 @@ use schema::{SchemaRocksIndex, SchemaRocksTable};
 use smallvec::alloc::fmt::Formatter;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+
 use std::fmt::{Debug, Display};
 use std::mem::take;
 use std::path::{Path, PathBuf};
@@ -78,6 +83,7 @@ use table::Table;
 use table::{TableRocksIndex, TableRocksTable};
 use tokio::fs::File;
 use tokio::sync::broadcast::Sender;
+
 use wal::WALRocksTable;
 
 #[macro_export]
@@ -140,13 +146,17 @@ macro_rules! base_rocks_secondary_index {
             fn is_unique(&self) -> bool {
                 RocksSecondaryIndex::is_unique(self)
             }
+
+            fn is_ttl(&self) -> bool {
+                RocksSecondaryIndex::is_ttl(self)
+            }
         }
     };
 }
 
 #[macro_export]
 macro_rules! rocks_table_impl {
-    ($table: ty, $rocks_table: ident, $table_id: expr, $indexes: block) => {
+    ($table: ty, $rocks_table: ident, $table_id: expr, $indexes: block, $cfn: expr) => {
         pub(crate) struct $rocks_table<'a> {
             db: crate::metastore::DbTableRef<'a>,
         }
@@ -159,6 +169,10 @@ macro_rules! rocks_table_impl {
 
         impl<'a> RocksTable for $rocks_table<'a> {
             type T = $table;
+
+            fn cf_name(&self) -> ColumnFamilyName {
+                $cfn
+            }
 
             fn db(&self) -> &DB {
                 self.db.db
@@ -505,6 +519,35 @@ pub struct Column {
     column_index: usize,
 }
 
+impl Column {
+    pub fn new(name: String, column_type: ColumnType, column_index: usize) -> Column {
+        Column {
+            name,
+            column_type,
+            column_index,
+        }
+    }
+    pub fn get_name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn get_column_type(&self) -> &ColumnType {
+        &self.column_type
+    }
+
+    pub fn get_index(&self) -> usize {
+        self.column_index
+    }
+
+    pub fn replace_index(&self, column_index: usize) -> Column {
+        Column {
+            name: self.name.clone(),
+            column_type: self.column_type.clone(),
+            column_index,
+        }
+    }
+}
+
 impl Into<Field> for Column {
     fn into(self) -> Field {
         (&self).into()
@@ -678,6 +721,17 @@ pub struct Partition {
 }
 
 data_frame_from! {
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct CacheItem {
+    key: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    expire: Option<DateTime<Utc>>
+}
+}
+
+data_frame_from! {
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq, Hash)]
 pub struct Chunk {
     partition_id: u64,
@@ -836,6 +890,7 @@ meta_store_table_impl!(ChunkMetaStoreTable, Chunk, ChunkRocksTable);
 meta_store_table_impl!(IndexMetaStoreTable, Index, IndexRocksTable);
 meta_store_table_impl!(PartitionMetaStoreTable, Partition, PartitionRocksTable);
 meta_store_table_impl!(TableMetaStoreTable, Table, TableRocksTable);
+meta_store_table_impl!(CacheItemMetaStoreTable, CacheItem, CacheItemRocksTable);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PartitionData {
@@ -1124,6 +1179,17 @@ pub trait MetaStore: DIService + Send + Sync {
     ) -> Result<Vec<(IdRow<Schema>, IdRow<Table>, Vec<IdRow<Index>>)>, CubeError>;
 
     async fn debug_dump(&self, out_path: String) -> Result<(), CubeError>;
+
+    async fn all_cache(&self) -> Result<Vec<IdRow<CacheItem>>, CubeError>;
+    async fn cache_set(&self, item: CacheItem, nx: bool) -> Result<bool, CubeError>;
+    async fn cache_truncate(&self) -> Result<(), CubeError>;
+    async fn cache_delete(&self, key: String) -> Result<(), CubeError>;
+    async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError>;
+
+    // Force compaction for specific column family
+    async fn cf_compaction(&self, cf: ColumnFamilyName) -> Result<(), CubeError>;
+    // Get RocksDB dbstats for specific column family
+    async fn cf_statistics(&self, cf_name: ColumnFamilyName) -> Result<Option<String>, CubeError>;
 }
 
 crate::di_service!(RocksMetaStore, [MetaStore]);
@@ -1158,6 +1224,9 @@ pub enum MetaStoreEvent {
 
     UpdateMultiPartition(IdRow<MultiPartition>, IdRow<MultiPartition>),
     DeleteMultiPartition(IdRow<MultiPartition>),
+
+    UpdateCacheItem(IdRow<CacheItem>, IdRow<CacheItem>),
+    DeleteCacheItem(IdRow<CacheItem>),
 }
 
 type SecondaryKey = Vec<u8>;
@@ -1165,9 +1234,9 @@ type IndexId = u32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum RowKey {
-    Table(TableId, u64),
+    Table(TableId, /** row_id */ u64),
     Sequence(TableId),
-    SecondaryIndex(IndexId, SecondaryKey, u64),
+    SecondaryIndex(IndexId, SecondaryKey, /** row_id */ u64),
     SecondaryIndexInfo { index_id: IndexId },
 }
 
@@ -1181,33 +1250,45 @@ pub fn get_fixed_prefix() -> usize {
 }
 
 impl RowKey {
-    fn from_bytes(bytes: &[u8]) -> RowKey {
+    fn try_from_bytes(bytes: &[u8]) -> Result<RowKey, CubeError> {
         let mut reader = Cursor::new(bytes);
-        match reader.read_u8().unwrap() {
-            1 => RowKey::Table(TableId::from(reader.read_u32::<BigEndian>().unwrap()), {
-                // skip zero for fixed key padding
-                reader.read_u64::<BigEndian>().unwrap();
-                reader.read_u64::<BigEndian>().unwrap()
-            }),
-            2 => RowKey::Sequence(TableId::from(reader.read_u32::<BigEndian>().unwrap())),
+        match reader.read_u8()? {
+            1 => Ok(RowKey::Table(
+                TableId::from(reader.read_u32::<BigEndian>()?),
+                {
+                    // skip zero for fixed key padding
+                    reader.read_u64::<BigEndian>()?;
+                    reader.read_u64::<BigEndian>()?
+                },
+            )),
+            2 => Ok(RowKey::Sequence(TableId::from(
+                reader.read_u32::<BigEndian>()?,
+            ))),
             3 => {
-                let table_id = IndexId::from(reader.read_u32::<BigEndian>().unwrap());
+                let table_id = IndexId::from(reader.read_u32::<BigEndian>()?);
                 let mut secondary_key: SecondaryKey = SecondaryKey::new();
                 let sc_length = bytes.len() - 13;
                 for _i in 0..sc_length {
-                    secondary_key.push(reader.read_u8().unwrap());
+                    secondary_key.push(reader.read_u8()?);
                 }
-                let row_id = reader.read_u64::<BigEndian>().unwrap();
+                let row_id = reader.read_u64::<BigEndian>()?;
 
-                RowKey::SecondaryIndex(table_id, secondary_key, row_id)
+                Ok(RowKey::SecondaryIndex(table_id, secondary_key, row_id))
             }
             4 => {
-                let index_id = IndexId::from(reader.read_u32::<BigEndian>().unwrap());
+                let index_id = IndexId::from(reader.read_u32::<BigEndian>()?);
 
-                RowKey::SecondaryIndexInfo { index_id }
+                Ok(RowKey::SecondaryIndexInfo { index_id })
             }
-            v => panic!("Unknown key prefix: {}", v),
+            v => Err(CubeError::internal(format!(
+                "Unable to read RowKey with key prefix: {}",
+                v
+            ))),
         }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> RowKey {
+        RowKey::try_from_bytes(bytes).unwrap()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -1281,7 +1362,26 @@ enum_from_primitive! {
         Jobs = 0x0700,
         Sources = 0x0800,
         MultiIndexes = 0x0900,
-        MultiPartitions = 0x0A00
+        MultiPartitions = 0x0A00,
+        CacheItems = 0x0B00
+    }
+}
+
+impl TableId {
+    pub fn has_ttl(&self) -> bool {
+        match self {
+            TableId::Schemas => false,
+            TableId::Tables => false,
+            TableId::Indexes => false,
+            TableId::Partitions => false,
+            TableId::Chunks => false,
+            TableId::WALs => false,
+            TableId::Jobs => false,
+            TableId::Sources => false,
+            TableId::MultiIndexes => false,
+            TableId::MultiPartitions => false,
+            TableId::CacheItems => true,
+        }
     }
 }
 
@@ -1296,6 +1396,7 @@ fn check_indexes_for_all_tables<'a>(table_ref: DbTableRef<'a>) -> Result<(), Cub
     SourceRocksTable::new(table_ref.clone()).check_indexes()?;
     MultiIndexRocksTable::new(table_ref.clone()).check_indexes()?;
     MultiPartitionRocksTable::new(table_ref.clone()).check_indexes()?;
+    CacheItemRocksTable::new(table_ref.clone()).check_indexes()?;
     Ok(())
 }
 
@@ -1314,6 +1415,9 @@ impl MemorySequence {
     }
 }
 
+type RwLoopTx =
+    std::sync::mpsc::SyncSender<Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>>;
+
 #[derive(Clone)]
 pub struct RocksMetaStore {
     pub db: Arc<DB>,
@@ -1328,10 +1432,10 @@ pub struct RocksMetaStore {
     upload_loop: Arc<WorkerLoop>,
     config: Arc<dyn ConfigObj>,
     cached_tables: Arc<Mutex<Option<Arc<Vec<TablePath>>>>>,
-    rw_loop_tx: std::sync::mpsc::SyncSender<
-        Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>,
-    >,
-    _rw_loop_join_handle: Arc<AbortingJoinHandle<()>>,
+    default_rw_loop_tx: RwLoopTx,
+    cache_rw_loop_tx: RwLoopTx,
+    _default_rw_loop_join_handle: Arc<AbortingJoinHandle<()>>,
+    _cache_rw_loop_join_handle: Arc<AbortingJoinHandle<()>>,
 }
 
 trait BaseRocksSecondaryIndex<T>: Debug {
@@ -1351,6 +1455,8 @@ trait BaseRocksSecondaryIndex<T>: Debug {
     }
 
     fn is_unique(&self) -> bool;
+
+    fn is_ttl(&self) -> bool;
 
     fn version(&self) -> u32;
 }
@@ -1374,6 +1480,10 @@ trait RocksSecondaryIndex<T, K: Hash>: BaseRocksSecondaryIndex<T> {
     fn is_unique(&self) -> bool;
 
     fn version(&self) -> u32;
+
+    fn is_ttl(&self) -> bool {
+        false
+    }
 }
 
 impl<T, I> BaseRocksSecondaryIndex<T> for I
@@ -1390,6 +1500,10 @@ where
 
     fn is_unique(&self) -> bool {
         RocksSecondaryIndex::is_unique(self)
+    }
+
+    fn is_ttl(&self) -> bool {
+        RocksSecondaryIndex::is_ttl(self)
     }
 
     fn version(&self) -> u32 {
@@ -1477,6 +1591,14 @@ trait RocksTable: Debug + Send + Sync {
         D: Deserializer<'de>;
     fn indexes() -> Vec<Box<dyn BaseRocksSecondaryIndex<Self::T>>>;
 
+    fn cf(&self) -> Result<&ColumnFamily, CubeError> {
+        self.db()
+            .cf_handle(self.cf_name().into())
+            .ok_or_else(|| CubeError::internal(format!("cf {} not found", self.cf_name())))
+    }
+
+    fn cf_name(&self) -> ColumnFamilyName;
+
     fn insert(
         &self,
         row: Self::T,
@@ -1504,17 +1626,30 @@ trait RocksTable: Debug + Send + Sync {
 
         let (row_id, inserted_row) = self.insert_row(serialized_row)?;
         batch_pipe.add_event(MetaStoreEvent::Insert(self.table_id(), row_id));
-        if self.snapshot().get(&inserted_row.key)?.is_some() {
+        if self
+            .snapshot()
+            .get_cf(self.cf()?, &inserted_row.key)?
+            .is_some()
+        {
             return Err(CubeError::internal(format!("Primary key constraint violation. Primary key already exists for a row id {}: {:?}", row_id, &row)));
         }
-        batch_pipe.batch().put(inserted_row.key, inserted_row.val);
+        batch_pipe
+            .batch()
+            .put_cf(self.cf()?, inserted_row.key, inserted_row.val);
 
         let index_row = self.insert_index_row(&row, row_id)?;
         for to_insert in index_row {
-            if self.snapshot().get(&to_insert.key)?.is_some() {
+            if self
+                .snapshot()
+                .get_cf(self.cf()?, &to_insert.key)?
+                .is_some()
+            {
                 return Err(CubeError::internal(format!("Primary key constraint violation in secondary index. Primary key already exists for a row id {}: {:?}", row_id, &row)));
             }
-            batch_pipe.batch().put(to_insert.key, to_insert.val);
+            println!("put index {:?} {:?}", to_insert.key, to_insert.val);
+            batch_pipe
+                .batch()
+                .put_cf(self.cf()?, to_insert.key, to_insert.val);
         }
 
         Ok(IdRow::new(row_id, row))
@@ -1523,7 +1658,8 @@ trait RocksTable: Debug + Send + Sync {
     fn check_indexes(&self) -> Result<(), CubeError> {
         let snapshot = self.snapshot();
         for index in Self::indexes().into_iter() {
-            let index_info = snapshot.get(
+            let index_info = snapshot.get_cf(
+                self.cf()?,
                 &RowKey::SecondaryIndexInfo {
                     index_id: self.index_id(index.get_id()),
                 }
@@ -1577,9 +1713,13 @@ trait RocksTable: Debug + Send + Sync {
             }
             let row = row?;
             let index_row = self.index_key_val(row.get_row(), row.get_id(), index);
+            println!("put index {:?} {:?}", index_row.key, index_row.val);
+
             batch.put(index_row.key, index_row.val);
         }
-        batch.put(
+
+        batch.put_cf(
+            self.cf()?,
             &RowKey::SecondaryIndexInfo {
                 index_id: self.index_id(index.get_id()),
             }
@@ -1590,6 +1730,7 @@ trait RocksTable: Debug + Send + Sync {
             .as_slice(),
         );
         self.db().write(batch)?;
+
         if log_shown {
             log::info!(
                 "Rebuilding metastore index {:?} for table {:?} complete ({:?})",
@@ -1598,6 +1739,7 @@ trait RocksTable: Debug + Send + Sync {
                 time.elapsed()?
             );
         }
+
         Ok(())
     }
 
@@ -1640,7 +1782,9 @@ trait RocksTable: Debug + Send + Sync {
                     .into_iter()
                     .find(|i| i.get_id() == BaseRocksSecondaryIndex::get_id(secondary_index))
                     .unwrap();
+
                 self.rebuild_index(&index)?;
+
                 return Err(CubeError::internal(format!(
                     "Row exists in secondary index however missing in {:?} table: {}. Repairing index.",
                     self, id
@@ -1671,6 +1815,18 @@ trait RocksTable: Debug + Send + Sync {
             "One value expected in {:?} for {:?} but nothing found",
             self, row_key
         )))?)
+    }
+
+    fn get_single_opt_row_by_index<K: Debug>(
+        &self,
+        row_key: &K,
+        secondary_index: &impl RocksSecondaryIndex<Self::T, K>,
+    ) -> Result<Option<IdRow<Self::T>>, CubeError>
+    where
+        K: Hash,
+    {
+        let rows = self.get_rows_by_index(row_key, secondary_index)?;
+        Ok(rows.into_iter().nth(0))
     }
 
     fn update_with_fn(
@@ -1732,10 +1888,12 @@ trait RocksTable: Debug + Send + Sync {
         batch_pipe.add_event(MetaStoreEvent::Delete(self.table_id(), row_id));
         batch_pipe.add_event(self.delete_event(row.clone()));
         for row in deleted_row {
-            batch_pipe.batch().delete(row.key);
+            batch_pipe.batch().delete_cf(self.cf()?, row.key);
         }
 
-        batch_pipe.batch().delete(self.delete_row(row_id)?.key);
+        batch_pipe
+            .batch()
+            .delete_cf(self.cf()?, self.delete_row(row_id)?.key);
 
         Ok(row)
     }
@@ -1797,7 +1955,10 @@ trait RocksTable: Debug + Send + Sync {
 
     fn get_row(&self, row_id: u64) -> Result<Option<IdRow<Self::T>>, CubeError> {
         let ref db = self.snapshot();
-        let res = db.get(RowKey::Table(self.table_id(), row_id).to_bytes())?;
+        let res = db.get_cf(
+            self.cf()?,
+            RowKey::Table(self.table_id(), row_id).to_bytes(),
+        )?;
 
         if let Some(buffer) = res {
             let row = self.deserialize_id_row(row_id, buffer.as_slice())?;
@@ -1829,11 +1990,13 @@ trait RocksTable: Debug + Send + Sync {
     ) -> KeyVal {
         let hash = index.key_hash(row);
         let index_val = index.index_key_by(row);
+
         let key = RowKey::SecondaryIndex(
             self.index_id(index.get_id()),
             hash.to_be_bytes().to_vec(),
             row_id,
         );
+
         KeyVal {
             key: key.to_bytes(),
             val: index_val,
@@ -1873,9 +2036,10 @@ trait RocksTable: Debug + Send + Sync {
 
         let mut opts = ReadOptions::default();
         opts.set_prefix_same_as_start(true);
-        let iter = db.iterator_opt(
-            IteratorMode::From(&key_min.to_bytes()[0..(key_len + 5)], Direction::Forward),
+        let iter = db.iterator_cf_opt(
+            self.cf()?,
             opts,
+            IteratorMode::From(&key_min.to_bytes()[0..(key_len + 5)], Direction::Forward),
         );
 
         for (key, value) in iter {
@@ -1911,16 +2075,16 @@ trait RocksTable: Debug + Send + Sync {
         let key_len = zero_vec.len();
         let key_min = RowKey::SecondaryIndex(self.index_id(secondary_id), zero_vec.clone(), 0);
 
-        let iter = db.iterator(IteratorMode::From(
-            &key_min.to_bytes()[0..(key_len + 5)],
-            Direction::Forward,
-        ));
+        let iter = db.iterator_cf(
+            self.cf()?,
+            IteratorMode::From(&key_min.to_bytes()[0..(key_len + 5)], Direction::Forward),
+        );
 
         for (key, _) in iter {
             let row_key = RowKey::from_bytes(&key);
             if let RowKey::SecondaryIndex(index_id, _, _) = row_key {
                 if index_id == self.index_id(secondary_id) {
-                    batch.delete(key);
+                    batch.delete_cf(self.cf()?, key);
                 } else {
                     return Ok(());
                 }
@@ -1985,12 +2149,14 @@ trait RocksTable: Debug + Send + Sync {
 
         let mut opts = ReadOptions::default();
         opts.set_prefix_same_as_start(true);
-        let iterator = db.iterator_opt(
+
+        let iterator = db.iterator_cf_opt(
+            self.cf()?,
+            opts,
             IteratorMode::From(
                 &key_min.to_bytes()[0..get_fixed_prefix()],
                 Direction::Forward,
             ),
-            opts,
         );
 
         Ok(TableScanIter {
@@ -2084,7 +2250,7 @@ impl WriteBatchIterator for WriteBatchContainer {
     }
 }
 
-fn meta_store_merge(
+fn meta_store_default_cf_merge(
     _new_key: &[u8],
     existing_val: Option<&[u8]>,
     operands: &mut MergeOperands,
@@ -2098,6 +2264,36 @@ fn meta_store_merge(
     }
     result.write_u64::<BigEndian>(counter).unwrap();
     Some(result)
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Debug)]
+pub enum ColumnFamilyName {
+    Default,
+    Cache,
+}
+
+impl Into<&str> for ColumnFamilyName {
+    fn into(self) -> &'static str {
+        match self {
+            ColumnFamilyName::Default => DEFAULT_COLUMN_FAMILY_NAME,
+            ColumnFamilyName::Cache => "cache",
+        }
+    }
+}
+
+impl From<ColumnFamilyName> for String {
+    fn from(r: ColumnFamilyName) -> Self {
+        match r {
+            ColumnFamilyName::Default => DEFAULT_COLUMN_FAMILY_NAME.to_string(),
+            ColumnFamilyName::Cache => "cache".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ColumnFamilyName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_string())
+    }
 }
 
 impl RocksMetaStore {
@@ -2117,23 +2313,67 @@ impl RocksMetaStore {
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
     ) -> RocksMetaStore {
+        let default_cf = {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(13));
+            opts.set_merge_operator_associative("meta_store merge", meta_store_default_cf_merge);
+
+            ColumnFamilyDescriptor::new(ColumnFamilyName::Default, opts)
+        };
+
+        let cache_cf = {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(13));
+            opts.set_merge_operator_associative("meta_store merge", meta_store_default_cf_merge);
+            opts.set_compaction_filter_factory(compaction::MetaStoreCacheCompactionFactory::new());
+            opts.enable_statistics();
+
+            ColumnFamilyDescriptor::new(ColumnFamilyName::Cache, opts)
+        };
+
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
         opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(13));
-        opts.set_merge_operator_associative("meta_store merge", meta_store_merge);
+        opts.set_merge_operator_associative("meta_store merge", meta_store_default_cf_merge);
 
-        let db = DB::open(&opts, path).unwrap();
+        let db = DB::open_cf_descriptors(&opts, path, vec![default_cf, cache_cf]).unwrap();
+        db.set_options_cf(
+            db.cf_handle(ColumnFamilyName::Cache.into()).unwrap(),
+            &[("periodic_compaction_seconds", "60")],
+        )
+        .unwrap();
+
         let db_arc = Arc::new(db);
 
-        let (rw_loop_tx, rw_loop_rx) = std::sync::mpsc::sync_channel::<
+        let (default_rw_loop_tx, default_rw_loop_rx) = std::sync::mpsc::sync_channel::<
             Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>,
         >(32_768);
 
-        let join_handle = cube_ext::spawn_blocking(move || loop {
-            match rw_loop_rx.recv() {
+        let (cache_rw_loop_tx, cache_rw_loop_rx) = std::sync::mpsc::sync_channel::<
+            Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>,
+        >(32_768);
+
+        let join_handle_default = cube_ext::spawn_blocking(move || loop {
+            match default_rw_loop_rx.recv() {
                 Ok(fun) => {
                     if let Err(e) = fun() {
-                        log::error!("Error during read write loop execution: {}", e);
+                        log::error!("Error during read write default loop execution: {}", e);
+                    }
+                }
+                Err(_) => {
+                    return;
+                }
+            }
+        });
+
+        let join_handle_cache = cube_ext::spawn_blocking(move || loop {
+            match cache_rw_loop_rx.recv() {
+                Ok(fun) => {
+                    if let Err(e) = fun() {
+                        log::error!("Error during read write cache loop execution: {}", e);
                     }
                 }
                 Err(_) => {
@@ -2155,8 +2395,10 @@ impl RocksMetaStore {
             upload_loop: Arc::new(WorkerLoop::new("Meta Store Upload")),
             config,
             cached_tables: Arc::new(Mutex::new(None)),
-            rw_loop_tx,
-            _rw_loop_join_handle: Arc::new(AbortingJoinHandle::new(join_handle)),
+            default_rw_loop_tx,
+            cache_rw_loop_tx,
+            _default_rw_loop_join_handle: Arc::new(AbortingJoinHandle::new(join_handle_default)),
+            _cache_rw_loop_join_handle: Arc::new(AbortingJoinHandle::new(join_handle_cache)),
         };
         meta_store
     }
@@ -2230,16 +2472,39 @@ impl RocksMetaStore {
             + 'static,
         R: Send + Sync + 'static,
     {
+        self.write_operation_impl(self.default_rw_loop_tx.clone(), f)
+            .await
+    }
+
+    async fn write_operation_cache<F, R>(&self, f: F) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>, &'a mut BatchPipe) -> Result<R, CubeError>
+            + Send
+            + Sync
+            + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.write_operation_impl(self.cache_rw_loop_tx.clone(), f)
+            .await
+    }
+
+    async fn write_operation_impl<F, R>(&self, rw_loop_tx: RwLoopTx, f: F) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>, &'a mut BatchPipe) -> Result<R, CubeError>
+            + Send
+            + Sync
+            + 'static,
+        R: Send + Sync + 'static,
+    {
         let db = self.db.clone();
         let mem_seq = MemorySequence {
             seq_store: self.seq_store.clone(),
         };
         let db_to_send = db.clone();
         let cached_tables = self.cached_tables.clone();
-        let rw_loop_sender = self.rw_loop_tx.clone();
         let (tx, rx) = oneshot::channel::<Result<(R, Vec<MetaStoreEvent>), CubeError>>();
         cube_ext::spawn_blocking(move || {
-            let res = rw_loop_sender.send(Box::new(move || {
+            let res = rw_loop_tx.send(Box::new(move || {
                 let db_span = warn_long("metastore write operation", Duration::from_millis(100));
 
                 let mut batch = BatchPipe::new(db_to_send.as_ref());
@@ -2424,7 +2689,7 @@ impl RocksMetaStore {
         )
     }
 
-    async fn read_operation<F, R>(&self, f: F) -> Result<R, CubeError>
+    async fn read_operation_impl<F, R>(&self, rw_loop_tx: RwLoopTx, f: F) -> Result<R, CubeError>
     where
         F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
         R: Send + Sync + 'static,
@@ -2434,10 +2699,9 @@ impl RocksMetaStore {
         };
         let db_to_send = self.db.clone();
 
-        let rw_loop_sender = self.rw_loop_tx.clone();
         let (tx, rx) = oneshot::channel::<Result<R, CubeError>>();
         cube_ext::spawn_blocking(move || {
-            let res = rw_loop_sender.send(Box::new(move || {
+            let res = rw_loop_tx.send(Box::new(move || {
                 let db_span = warn_long("metastore read operation", Duration::from_millis(100));
 
                 let snapshot = db_to_send.snapshot();
@@ -2464,6 +2728,26 @@ impl RocksMetaStore {
         .await?;
 
         rx.await?
+    }
+
+    // Put read operation for default cf queue
+    async fn read_operation<F, R>(&self, f: F) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.read_operation_impl(self.default_rw_loop_tx.clone(), f)
+            .await
+    }
+
+    // Put read operation for cache cf queue
+    async fn read_operation_cache<F, R>(&self, f: F) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.read_operation_impl(self.cache_rw_loop_tx.clone(), f)
+            .await
     }
 
     async fn read_operation_out_of_queue<F, R>(&self, f: F) -> Result<R, CubeError>
@@ -3363,6 +3647,129 @@ impl MetaStore for RocksMetaStore {
                 RocksMetaStore::drop_index(db_ref.clone(), batch_pipe, index, true)?;
             }
             Ok(tables_table.delete(table_id, batch_pipe)?)
+        })
+        .await
+    }
+
+    async fn all_cache(&self) -> Result<Vec<IdRow<CacheItem>>, CubeError> {
+        self.read_operation_out_of_queue(move |db_ref| {
+            Ok(CacheItemRocksTable::new(db_ref).all_rows()?)
+        })
+        .await
+    }
+
+    async fn cache_set(&self, item: CacheItem, nx: bool) -> Result<bool, CubeError> {
+        self.write_operation_cache(move |db_ref, batch_pipe| {
+            let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+            let index_key = CacheItemIndexKey::ByKey(item.key.clone());
+            let id_row_opt =
+                cache_schema.get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::Key)?;
+
+            if let Some(id_row) = id_row_opt {
+                if nx && !id_row.row.is_expired() {
+                    return Ok(false);
+                };
+
+                cache_schema.update_with_fn(
+                    id_row.id,
+                    move |row| {
+                        let mut new = row.clone();
+                        new.value = item.value;
+                        new.expire = item.expire;
+
+                        new
+                    },
+                    batch_pipe,
+                )?;
+            } else {
+                cache_schema.insert(item, batch_pipe)?;
+            }
+
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn cache_truncate(&self) -> Result<(), CubeError> {
+        self.write_operation_cache(move |db_ref, batch_pipe| {
+            let jobs_table = CacheItemRocksTable::new(db_ref);
+            let all_jobs = jobs_table.all_rows()?;
+            for job in all_jobs.iter() {
+                jobs_table.delete(job.get_id(), batch_pipe)?;
+            }
+
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn cache_delete(&self, key: String) -> Result<(), CubeError> {
+        self.write_operation_cache(move |db_ref, batch_pipe| {
+            let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+            let index_key = CacheItemIndexKey::ByKey(key);
+            let row_opt =
+                cache_schema.get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::Key)?;
+
+            if let Some(row) = row_opt {
+                cache_schema.delete(row.id, batch_pipe)?;
+            }
+
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn cf_compaction(&self, cf_name: ColumnFamilyName) -> Result<(), CubeError> {
+        self.write_operation(move |db_ref, _batch_pipe| {
+            let cf = db_ref
+                .db
+                .cf_handle(cf_name.into())
+                .ok_or_else(|| CubeError::internal(format!("cf {} not found", cf_name)))?;
+
+            let start: Option<&[u8]> = None;
+            let end: Option<&[u8]> = None;
+
+            db_ref.db.compact_range_cf(cf, start, end);
+
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn cf_statistics(&self, cf_name: ColumnFamilyName) -> Result<Option<String>, CubeError> {
+        self.read_operation(move |db_ref| {
+            let cf = db_ref
+                .db
+                .cf_handle(cf_name.into())
+                .ok_or_else(|| CubeError::internal(format!("cf {} not found", cf_name)))?;
+
+            let res = db_ref.db.property_value_cf(cf, "rocksdb.stats")?;
+
+            Ok(res)
+        })
+        .await
+    }
+
+    async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError> {
+        self.read_operation_cache(move |db_ref| {
+            let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+            let index_key = CacheItemIndexKey::ByKey(key);
+            let id_row_opt =
+                cache_schema.get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::Key)?;
+
+            if let Some(id_row) = id_row_opt {
+                if !id_row.row.is_expired() {
+                    return Ok(Some(id_row));
+                }
+            };
+
+            Ok(None)
         })
         .await
     }
